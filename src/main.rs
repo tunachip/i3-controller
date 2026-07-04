@@ -183,7 +183,7 @@ fn print_help() {
     println!("  i3-controller wizard [config]");
     println!("  i3-controller generate <config> [output]\n");
 
-    println!("Generated scripts require i3-msg, xdotool, pkill, and a POSIX shell.");
+    println!("Generated scripts require i3-msg, xdotool, pkill, python3, and a POSIX shell.");
     println!(
         "The wizard can preview layouts from inside i3 and can import Chromium URLs when Chromium exposes a DevTools port."
     );
@@ -1037,6 +1037,10 @@ fn generate_script(config: &Config) -> Result<String> {
         script,
         "command -v setsid >/dev/null 2>&1 || {{ echo 'setsid is required' >&2; exit 1; }}"
     )?;
+    writeln!(
+        script,
+        "command -v python3 >/dev/null 2>&1 || {{ echo 'python3 is required' >&2; exit 1; }}"
+    )?;
     writeln!(script)?;
     writeln!(script, "i3() {{")?;
     writeln!(script, "  if ! i3-msg \"$@\"; then")?;
@@ -1045,10 +1049,36 @@ fn generate_script(config: &Config) -> Result<String> {
     writeln!(script, "}}")?;
     writeln!(script)?;
     writeln!(script, "i3_window_ids() {{")?;
+    writeln!(script, "  i3-msg -t get_tree | python3 -c 'import json,sys")?;
+    writeln!(script, "tree=json.load(sys.stdin)")?;
+    writeln!(script, "def walk(node):")?;
+    writeln!(script, "    if node.get(\"window\") is not None:")?;
+    writeln!(script, "        print(node[\"window\"])")?;
     writeln!(
         script,
-        "  i3-msg -t get_tree | tr ',{{}}' '\\n\\n\\n' | sed -n 's/.*\"window\":[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p'"
+        "    for child in node.get(\"nodes\", []) + node.get(\"floating_nodes\", []):"
     )?;
+    writeln!(script, "        walk(child)")?;
+    writeln!(script, "walk(tree)'")?;
+    writeln!(script, "}}")?;
+    writeln!(script)?;
+    writeln!(script, "i3_window_id_for_mark() {{")?;
+    writeln!(script, "  mark=$1")?;
+    writeln!(script, "  i3-msg -t get_tree | python3 -c 'import json,sys")?;
+    writeln!(script, "target=sys.argv[1]")?;
+    writeln!(script, "tree=json.load(sys.stdin)")?;
+    writeln!(script, "def walk(node):")?;
+    writeln!(
+        script,
+        "    if target in node.get(\"marks\", []) and node.get(\"window\") is not None:"
+    )?;
+    writeln!(script, "        print(node[\"window\"]); raise SystemExit")?;
+    writeln!(
+        script,
+        "    for child in node.get(\"nodes\", []) + node.get(\"floating_nodes\", []):"
+    )?;
+    writeln!(script, "        walk(child)")?;
+    writeln!(script, "walk(tree)' \"$mark\"")?;
     writeln!(script, "}}")?;
     writeln!(script)?;
     writeln!(script, "i3_try_match() {{")?;
@@ -1089,16 +1119,14 @@ fn generate_script(config: &Config) -> Result<String> {
     writeln!(script, "  attempts=${{4:-30}}")?;
     writeln!(
         script,
-        "  if i3_try_match \"con_mark=\\\"$mark\\\"\" \"$command\" \"$attempts\"; then"
+        "  if window_id=$(i3_app_window_id \"$mark\" \"$fallback\" \"$attempts\"); then"
+    )?;
+    writeln!(
+        script,
+        "    i3_match \"id=\\\"$window_id\\\"\" \"$command\" 1"
     )?;
     writeln!(script, "    return 0")?;
     writeln!(script, "  fi")?;
-    writeln!(script, "  if [ -n \"$fallback\" ]; then")?;
-    writeln!(
-        script,
-        "    i3_match \"$fallback\" \"$command\" \"$attempts\""
-    )?;
-    writeln!(script, "  else")?;
     writeln!(
         script,
         "    echo \"i3-controller: no marked window found for $mark: $command\" >&2"
@@ -1107,23 +1135,38 @@ fn generate_script(config: &Config) -> Result<String> {
         script,
         "    [ -n \"$I3_MATCH_OUTPUT\" ] && echo \"$I3_MATCH_OUTPUT\" >&2"
     )?;
-    writeln!(script, "  fi")?;
     writeln!(script, "}}")?;
     writeln!(script)?;
     writeln!(script, "i3_mark_new_window() {{")?;
     writeln!(script, "  mark=$1")?;
     writeln!(script, "  before_file=$2")?;
-    writeln!(script, "  attempts=${{3:-30}}")?;
+    writeln!(script, "  criteria=$3")?;
+    writeln!(script, "  attempts=${{4:-30}}")?;
     writeln!(script, "  while [ \"$attempts\" -gt 0 ]; do")?;
     writeln!(script, "    for window_id in $(i3_window_ids); do")?;
     writeln!(
         script,
         "      if ! grep -qx \"$window_id\" \"$before_file\" 2>/dev/null; then"
     )?;
+    writeln!(script, "        if [ -n \"$criteria\" ]; then")?;
     writeln!(
         script,
-        "        i3 \"[id=\\\"$window_id\\\"] mark --replace $mark\""
+        "          i3-msg \"[id=\\\"$window_id\\\" $criteria] mark --replace $mark\" >/dev/null 2>&1 || true"
     )?;
+    writeln!(
+        script,
+        "          marked_window_id=$(i3_window_id_for_mark \"$mark\")"
+    )?;
+    writeln!(
+        script,
+        "          [ \"$marked_window_id\" = \"$window_id\" ] || continue"
+    )?;
+    writeln!(script, "        else")?;
+    writeln!(
+        script,
+        "          i3 \"[id=\\\"$window_id\\\"] mark --replace $mark\""
+    )?;
+    writeln!(script, "        fi")?;
     writeln!(
         script,
         "        echo \"$window_id\" > \"$STATE_DIR/$mark.window\""
@@ -1138,6 +1181,74 @@ fn generate_script(config: &Config) -> Result<String> {
         script,
         "  echo \"i3-controller: failed to identify new window for $mark\" >&2"
     )?;
+    writeln!(script, "}}")?;
+    writeln!(script)?;
+    writeln!(script, "i3_app_window_id() {{")?;
+    writeln!(script, "  mark=$1")?;
+    writeln!(script, "  fallback=$2")?;
+    writeln!(script, "  attempts=${{3:-30}}")?;
+    writeln!(script, "  while [ \"$attempts\" -gt 0 ]; do")?;
+    writeln!(
+        script,
+        "    stored_window_id=$(cat \"$STATE_DIR/$mark.window\" 2>/dev/null || true)"
+    )?;
+    writeln!(
+        script,
+        "    marked_window_id=$(i3_window_id_for_mark \"$mark\")"
+    )?;
+    writeln!(
+        script,
+        "    if [ -n \"$stored_window_id\" ] && [ \"$stored_window_id\" = \"$marked_window_id\" ]; then"
+    )?;
+    writeln!(script, "      echo \"$stored_window_id\"")?;
+    writeln!(script, "      return 0")?;
+    writeln!(script, "    fi")?;
+    writeln!(script, "    if [ -n \"$marked_window_id\" ]; then")?;
+    writeln!(script, "      echo \"$marked_window_id\"")?;
+    writeln!(script, "      return 0")?;
+    writeln!(script, "    fi")?;
+    writeln!(script, "    if [ -n \"$fallback\" ]; then")?;
+    writeln!(script, "      probe=\"${{mark}}-probe-$$\"")?;
+    writeln!(
+        script,
+        "      i3-msg \"[$fallback] mark --add $probe\" >/dev/null 2>&1 || true"
+    )?;
+    writeln!(
+        script,
+        "      fallback_window_id=$(i3_window_id_for_mark \"$probe\")"
+    )?;
+    writeln!(
+        script,
+        "      i3-msg \"[con_mark=\\\"$probe\\\"] unmark $probe\" >/dev/null 2>&1 || true"
+    )?;
+    writeln!(script, "      if [ -n \"$fallback_window_id\" ]; then")?;
+    writeln!(script, "        echo \"$fallback_window_id\"")?;
+    writeln!(script, "        return 0")?;
+    writeln!(script, "      fi")?;
+    writeln!(script, "    fi")?;
+    writeln!(script, "    attempts=$((attempts - 1))")?;
+    writeln!(script, "    [ \"$attempts\" -gt 0 ] && sleep 1")?;
+    writeln!(script, "  done")?;
+    writeln!(script, "  return 1")?;
+    writeln!(script, "}}")?;
+    writeln!(script)?;
+    writeln!(script, "i3_focus_app() {{")?;
+    writeln!(script, "  mark=$1")?;
+    writeln!(script, "  fallback=$2")?;
+    writeln!(script, "  attempts=${{3:-30}}")?;
+    writeln!(
+        script,
+        "  window_id=$(i3_app_window_id \"$mark\" \"$fallback\" \"$attempts\") || return 1"
+    )?;
+    writeln!(
+        script,
+        "  i3-msg \"[id=\\\"$window_id\\\"] focus\" >/dev/null 2>&1 || true"
+    )?;
+    writeln!(
+        script,
+        "  xdotool windowactivate --sync \"$window_id\" >/dev/null 2>&1 || xdotool windowfocus \"$window_id\" >/dev/null 2>&1 || true"
+    )?;
+    writeln!(script, "  echo \"$window_id\"")?;
     writeln!(script, "}}")?;
     writeln!(script)?;
 
@@ -1243,9 +1354,10 @@ fn write_launch_app(script: &mut String, app: &App) -> Result<()> {
     }
     writeln!(
         script,
-        "i3_mark_new_window {} \"$STATE_DIR/{}-before.windows\" {}",
+        "i3_mark_new_window {} \"$STATE_DIR/{}-before.windows\" {} {}",
         shell_quote(&mark),
         file_safe(&app.name),
+        shell_quote(app.match_criteria.trim()),
         app.startup_delay.max(30)
     )?;
 
@@ -1312,17 +1424,33 @@ fn write_configure_app(script: &mut String, app: &App) -> Result<()> {
 fn write_text_entry(script: &mut String, app: &App, entry: &TextEntry) -> Result<()> {
     writeln!(script, "# Text-entry automation for {}.", app.name)?;
     writeln!(script, "( sleep {}", entry.delay)?;
-    focus_app(script, app)?;
+    let mark = window_mark(app);
+    writeln!(
+        script,
+        "  window_id=$(i3_focus_app {} {} {}) || exit 1",
+        shell_quote(&mark),
+        shell_quote(app.match_criteria.trim()),
+        app.startup_delay.max(30)
+    )?;
     for command in &entry.commands {
         match command {
-            TextCommand::Type(text) => {
-                writeln!(script, "  xdotool type --delay 20 -- {}", shell_quote(text))?
-            }
+            TextCommand::Type(text) => writeln!(
+                script,
+                "  xdotool type --window \"$window_id\" --delay 20 -- {}",
+                shell_quote(text)
+            )?,
             TextCommand::TypeEnv(name) => {
                 validate_env_name(name)?;
-                writeln!(script, "  xdotool type --delay 20 -- \"${{{name}:-}}\"")?;
+                writeln!(
+                    script,
+                    "  xdotool type --window \"$window_id\" --delay 20 -- \"${{{name}:-}}\""
+                )?;
             }
-            TextCommand::Key(key) => writeln!(script, "  xdotool key {}", shell_word(key))?,
+            TextCommand::Key(key) => writeln!(
+                script,
+                "  xdotool key --window \"$window_id\" {}",
+                shell_word(key)
+            )?,
             TextCommand::Wait(seconds) => writeln!(script, "  sleep {seconds}")?,
         }
     }
@@ -1394,7 +1522,7 @@ fn write_refresh_body(
     match event.action {
         RefreshAction::Reload => {
             focus_app_with_indent(script, app, indent)?;
-            writeln!(script, "{indent}xdotool key ctrl+r")?;
+            writeln!(script, "{indent}xdotool key --window \"$window_id\" ctrl+r")?;
         }
         RefreshAction::Relaunch => {
             if !app.match_criteria.is_empty() {
@@ -1413,18 +1541,14 @@ fn write_refresh_body(
     Ok(())
 }
 
-fn focus_app(script: &mut String, app: &App) -> Result<()> {
-    focus_app_with_indent(script, app, "  ")
-}
-
 fn focus_app_with_indent(script: &mut String, app: &App, indent: &str) -> Result<()> {
     if !app.match_criteria.is_empty() || !app.name.is_empty() {
         writeln!(
             script,
-            "{indent}i3_app {} {} {}",
+            "{indent}window_id=$(i3_focus_app {} {} {}) || exit 1",
             shell_quote(&window_mark(app)),
             shell_quote(app.match_criteria.trim()),
-            shell_quote("focus")
+            app.startup_delay.max(30)
         )?;
         writeln!(script, "{indent}sleep 1")?;
     }
@@ -1592,6 +1716,31 @@ mod tests {
         );
         assert!(script.contains("i3 'exec --no-startup-id"));
         assert!(script.contains("echo 'launching second'"));
+    }
+
+    #[test]
+    fn generated_window_marking_and_keys_use_target_window_ids() {
+        let mut config = two_app_config();
+        config.text_entries.push(TextEntry {
+            target: "first".to_string(),
+            delay: 1,
+            commands: vec![
+                TextCommand::Type("user".to_string()),
+                TextCommand::Key("Tab".to_string()),
+            ],
+        });
+
+        let script = generate_script(&config).expect("script should generate");
+
+        assert!(script.contains("command -v python3"));
+        assert!(script.contains(
+            "i3_mark_new_window 'i3-controller-first' \"$STATE_DIR/first-before.windows\" 'title=\"first\"' 30"
+        ));
+        assert!(script.contains(
+            "window_id=$(i3_focus_app 'i3-controller-first' 'title=\"first\"' 30) || exit 1"
+        ));
+        assert!(script.contains("xdotool type --window \"$window_id\" --delay 20 -- 'user'"));
+        assert!(script.contains("xdotool key --window \"$window_id\" Tab"));
     }
 
     #[test]
