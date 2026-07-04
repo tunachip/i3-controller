@@ -249,6 +249,9 @@ fn run_wizard(path: &Path) -> Result<()> {
             )?;
         } else {
             app.command = prompt_required("Command")?;
+            println!(
+                "Args are passed through a shell. For terminals, use something like: -e sh -lc 'cd ~/lab && ./plc_pinger.sh; exec sh'"
+            );
             app.args = prompt("Arguments", "")?;
         }
 
@@ -1088,7 +1091,7 @@ fn write_launch_app(script: &mut String, app: &App) -> Result<()> {
 
     match app.kind {
         AppKind::Native => {
-            let command = join_command(&app.command, &app.args);
+            let command = native_exec_command(app);
             writeln!(
                 script,
                 "i3-msg {}",
@@ -1270,12 +1273,13 @@ fn find_app<'a>(config: &'a Config, name: &str) -> Result<&'a App> {
         .ok_or_else(|| format!("unknown app target: {name}").into())
 }
 
-fn join_command(command: &str, args: &str) -> String {
-    if args.trim().is_empty() {
-        shell_word(command)
+fn native_exec_command(app: &App) -> String {
+    let command = if app.args.trim().is_empty() {
+        app.command.trim().to_string()
     } else {
-        format!("{} {}", shell_word(command), args.trim())
-    }
+        format!("{} {}", app.command.trim(), app.args.trim())
+    };
+    format!("sh -lc {}", shell_quote(&command))
 }
 
 fn shell_quote(value: &str) -> String {
