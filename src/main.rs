@@ -24,6 +24,7 @@ name=dashboard
 kind=web
 url=https://status.example.test
 browser=chromium-browser
+browser_args=--ignore-certificate-errors
 profile=/tmp/i3-controller-dashboard
 workspace=1
 match=title="Status"
@@ -71,6 +72,7 @@ struct App {
     args: String,
     url: String,
     browser: String,
+    browser_args: String,
     profile: String,
     workspace: String,
     match_criteria: String,
@@ -242,6 +244,7 @@ fn run_wizard(path: &Path) -> Result<()> {
 
         if app.kind == AppKind::Web {
             app.browser = prompt("Browser command", "chromium-browser")?;
+            app.browser_args = prompt("Extra browser flags", "")?;
             app.url = prompt_required_value("Web app URL", &choose_web_url()?)?;
             app.profile = prompt(
                 "Dedicated browser profile path",
@@ -505,6 +508,7 @@ fn preview_config(config: &Config) -> Result<()> {
             args: app.args.clone(),
             url: app.url.clone(),
             browser: app.browser.clone(),
+            browser_args: app.browser_args.clone(),
             profile: app.profile.clone(),
             workspace: workspace.to_string(),
             match_criteria: app.match_criteria.clone(),
@@ -552,6 +556,7 @@ fn config_to_string(config: &Config) -> Result<String> {
             AppKind::Web => {
                 write_pair(&mut output, "url", &app.url)?;
                 write_pair(&mut output, "browser", &app.browser)?;
+                write_pair(&mut output, "browser_args", &app.browser_args)?;
                 write_pair(&mut output, "profile", &app.profile)?;
             }
             AppKind::Native => {
@@ -818,6 +823,7 @@ fn parse_app(block: &Block) -> Result<App> {
             "args" => app.args = value.clone(),
             "url" => app.url = value.clone(),
             "browser" => app.browser = value.clone(),
+            "browser_args" => app.browser_args = value.clone(),
             "profile" => app.profile = value.clone(),
             "workspace" => app.workspace = value.clone(),
             "match" => app.match_criteria = value.clone(),
@@ -1027,6 +1033,10 @@ fn generate_script(config: &Config) -> Result<String> {
         script,
         "command -v xdotool >/dev/null 2>&1 || {{ echo 'xdotool is required' >&2; exit 1; }}"
     )?;
+    writeln!(
+        script,
+        "command -v setsid >/dev/null 2>&1 || {{ echo 'setsid is required' >&2; exit 1; }}"
+    )?;
     writeln!(script)?;
 
     for kill in &config.kills {
@@ -1092,6 +1102,7 @@ fn write_launch_app(script: &mut String, app: &App) -> Result<()> {
     match app.kind {
         AppKind::Native => {
             let command = native_exec_command(app);
+            let command = detached_exec_command(app, &command);
             writeln!(
                 script,
                 "i3-msg {}",
@@ -1104,9 +1115,13 @@ fn write_launch_app(script: &mut String, app: &App) -> Result<()> {
                 shell_word(&app.browser),
                 shell_word(&app.url)
             );
+            if !app.browser_args.is_empty() {
+                write!(command, " {}", app.browser_args.trim())?;
+            }
             if !app.profile.is_empty() {
                 write!(command, " --user-data-dir={}", shell_word(&app.profile))?;
             }
+            let command = detached_exec_command(app, &command);
             writeln!(
                 script,
                 "i3-msg {}",
@@ -1274,12 +1289,24 @@ fn find_app<'a>(config: &'a Config, name: &str) -> Result<&'a App> {
 }
 
 fn native_exec_command(app: &App) -> String {
-    let command = if app.args.trim().is_empty() {
+    if app.args.trim().is_empty() {
         app.command.trim().to_string()
     } else {
         format!("{} {}", app.command.trim(), app.args.trim())
-    };
-    format!("sh -lc {}", shell_quote(&command))
+    }
+}
+
+fn detached_exec_command(app: &App, command: &str) -> String {
+    let log_path = format!("/tmp/i3-controller-{}-launch.log", file_safe(&app.name));
+    let detach_log_path = format!("/tmp/i3-controller-{}-detach.log", file_safe(&app.name));
+    format!(
+        "sh -lc {}",
+        shell_quote(&format!(
+            "setsid -f sh -lc {} >{} 2>&1",
+            shell_quote(&format!("exec {command} >>{log_path} 2>&1")),
+            shell_word(&detach_log_path)
+        ))
+    )
 }
 
 fn shell_quote(value: &str) -> String {
