@@ -1,0 +1,20 @@
+/target/
+
+# Local agent/tooling state.
+/.agents/
+/.codex/
+/.pi/
+/.claude/
+/.cursor/
+/.mcp/
+/.aider*
+
+# Generated launch scripts/configs from local experimentation.
+i3-controller.conf
+i3-controller.sh
+
+# Editor and OS noise.
+*~
+*.swp
+*.swo
+.DS_Store
