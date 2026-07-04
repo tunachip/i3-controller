@@ -183,7 +183,7 @@ fn print_help() {
     println!("  i3-controller wizard [config]");
     println!("  i3-controller generate <config> [output]\n");
 
-    println!("Generated scripts require i3, i3-msg, xdotool, pkill, python3, and a POSIX shell.");
+    println!("Generated scripts require i3-msg, xdotool, pkill, python3, and a POSIX shell.");
     println!(
         "The wizard can preview layouts from inside i3 and can import Chromium URLs when Chromium exposes a DevTools port."
     );
@@ -1031,10 +1031,6 @@ fn generate_script(config: &Config) -> Result<String> {
     )?;
     writeln!(
         script,
-        "command -v i3 >/dev/null 2>&1 || {{ echo 'i3 is required' >&2; exit 1; }}"
-    )?;
-    writeln!(
-        script,
         "command -v xdotool >/dev/null 2>&1 || {{ echo 'xdotool is required' >&2; exit 1; }}"
     )?;
     writeln!(
@@ -1047,38 +1043,49 @@ fn generate_script(config: &Config) -> Result<String> {
     )?;
     writeln!(script)?;
     writeln!(script, "resolve_i3_socket() {{")?;
+    writeln!(script, "  try_i3_socket() {{")?;
+    writeln!(script, "    socket_path=$1")?;
+    writeln!(script, "    [ -n \"$socket_path\" ] || return 1")?;
+    writeln!(script, "    [ -S \"$socket_path\" ] || return 1")?;
+    writeln!(script, "    export I3SOCK=\"$socket_path\"")?;
+    writeln!(script, "    i3-msg -t get_version >/dev/null 2>&1")?;
+    writeln!(script, "  }}")?;
     writeln!(script, "  if i3-msg -t get_version >/dev/null 2>&1; then")?;
     writeln!(script, "    return 0")?;
     writeln!(script, "  fi")?;
-    writeln!(
-        script,
-        "  socket_path=$(i3 --get-socketpath 2>/dev/null || true)"
-    )?;
-    writeln!(
-        script,
-        "  if [ -n \"$socket_path\" ] && [ -S \"$socket_path\" ]; then"
-    )?;
-    writeln!(script, "    export I3SOCK=\"$socket_path\"")?;
-    writeln!(script, "  else")?;
-    writeln!(script, "    unset I3SOCK")?;
-    writeln!(
-        script,
-        "    socket_path=$(i3 --get-socketpath 2>/dev/null || true)"
-    )?;
-    writeln!(
-        script,
-        "    if [ -n \"$socket_path\" ] && [ -S \"$socket_path\" ]; then"
-    )?;
-    writeln!(script, "      export I3SOCK=\"$socket_path\"")?;
-    writeln!(script, "    fi")?;
+    writeln!(script, "  unset I3SOCK")?;
+    writeln!(script, "  if i3-msg -t get_version >/dev/null 2>&1; then")?;
+    writeln!(script, "    return 0")?;
     writeln!(script, "  fi")?;
-    writeln!(script, "  if ! i3-msg -t get_version >/dev/null 2>&1; then")?;
+    writeln!(script, "  if command -v i3 >/dev/null 2>&1; then")?;
     writeln!(
         script,
-        "    echo \"i3-controller: could not connect to i3; run this from inside the i3 session or export I3SOCK to the active socket\" >&2"
+        "    try_i3_socket \"$(i3 --get-socketpath 2>/dev/null || true)\" && return 0"
     )?;
-    writeln!(script, "    exit 1")?;
+    writeln!(
+        script,
+        "    try_i3_socket \"$(i3 --get-socket-path 2>/dev/null || true)\" && return 0"
+    )?;
     writeln!(script, "  fi")?;
+    writeln!(script, "  if command -v xprop >/dev/null 2>&1; then")?;
+    writeln!(
+        script,
+        "    socket_path=$(xprop -root _I3_SOCKET_PATH 2>/dev/null | sed -n 's/.*= \"\\(.*\\)\"/\\1/p')"
+    )?;
+    writeln!(script, "    try_i3_socket \"$socket_path\" && return 0")?;
+    writeln!(script, "  fi")?;
+    writeln!(script, "  for socket_path in \\")?;
+    writeln!(script, "    \"${{XDG_RUNTIME_DIR:-}}/i3/ipc-socket\"* \\")?;
+    writeln!(script, "    \"/run/user/$(id -u)/i3/ipc-socket\"* \\")?;
+    writeln!(script, "    /tmp/i3-*/ipc-socket* \\")?;
+    writeln!(script, "    /tmp/i3-ipc.sock; do")?;
+    writeln!(script, "    try_i3_socket \"$socket_path\" && return 0")?;
+    writeln!(script, "  done")?;
+    writeln!(
+        script,
+        "  echo \"i3-controller: could not connect to i3; run this from inside the i3 session or export I3SOCK to the active socket\" >&2"
+    )?;
+    writeln!(script, "  exit 1")?;
     writeln!(script, "}}")?;
     writeln!(script, "resolve_i3_socket")?;
     writeln!(script)?;
@@ -1734,9 +1741,14 @@ mod tests {
     fn generated_i3_commands_are_nonfatal() {
         let script = generate_script(&two_app_config()).expect("script should generate");
 
-        assert!(script.contains("command -v i3 >/dev/null"));
         assert!(script.contains("resolve_i3_socket() {"));
-        assert!(script.contains("socket_path=$(i3 --get-socketpath 2>/dev/null || true)"));
+        assert!(script.contains("try_i3_socket() {"));
+        assert!(script.contains("unset I3SOCK"));
+        assert!(script.contains("if command -v i3 >/dev/null 2>&1; then"));
+        assert!(script.contains("try_i3_socket \"$(i3 --get-socketpath 2>/dev/null || true)\""));
+        assert!(script.contains("if command -v xprop >/dev/null 2>&1; then"));
+        assert!(script.contains("xprop -root _I3_SOCKET_PATH"));
+        assert!(script.contains("\"${XDG_RUNTIME_DIR:-}/i3/ipc-socket\"*"));
         assert!(script.contains("export I3SOCK=\"$socket_path\""));
         assert!(
             script.contains("i3() {\n  if ! i3-msg \"$@\"; then"),
