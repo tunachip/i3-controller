@@ -1038,6 +1038,12 @@ fn generate_script(config: &Config) -> Result<String> {
         "command -v setsid >/dev/null 2>&1 || {{ echo 'setsid is required' >&2; exit 1; }}"
     )?;
     writeln!(script)?;
+    writeln!(script, "i3() {{")?;
+    writeln!(script, "  if ! i3-msg \"$@\"; then")?;
+    writeln!(script, "    echo \"i3-controller: i3-msg failed: $*\" >&2")?;
+    writeln!(script, "  fi")?;
+    writeln!(script, "}}")?;
+    writeln!(script)?;
 
     for kill in &config.kills {
         let label = if kill.name.is_empty() {
@@ -1094,7 +1100,7 @@ fn write_launch_app(script: &mut String, app: &App) -> Result<()> {
     if !app.workspace.is_empty() {
         writeln!(
             script,
-            "i3-msg {}",
+            "i3 {}",
             shell_quote(&format!("workspace {}", app.workspace))
         )?;
     }
@@ -1105,7 +1111,7 @@ fn write_launch_app(script: &mut String, app: &App) -> Result<()> {
             let command = detached_exec_command(app, &command);
             writeln!(
                 script,
-                "i3-msg {}",
+                "i3 {}",
                 shell_quote(&format!("exec --no-startup-id {command}"))
             )?;
         }
@@ -1124,7 +1130,7 @@ fn write_launch_app(script: &mut String, app: &App) -> Result<()> {
             let command = detached_exec_command(app, &command);
             writeln!(
                 script,
-                "i3-msg {}",
+                "i3 {}",
                 shell_quote(&format!("exec --no-startup-id {command}"))
             )?;
         }
@@ -1137,7 +1143,7 @@ fn write_launch_app(script: &mut String, app: &App) -> Result<()> {
         if !app.workspace.is_empty() {
             writeln!(
                 script,
-                "i3-msg {}",
+                "i3 {}",
                 shell_quote(&format!(
                     "[{}] move to workspace {}",
                     app.match_criteria, app.workspace
@@ -1152,7 +1158,7 @@ fn write_launch_app(script: &mut String, app: &App) -> Result<()> {
         {
             writeln!(
                 script,
-                "i3-msg {}",
+                "i3 {}",
                 shell_quote(&format!("[{}] {command}", app.match_criteria))
             )?;
         }
@@ -1253,7 +1259,7 @@ fn write_refresh_body(
             if !app.match_criteria.is_empty() {
                 writeln!(
                     script,
-                    "{indent}i3-msg {}",
+                    "{indent}i3 {}",
                     shell_quote(&format!("[{}] kill", app.match_criteria))
                 )?;
             }
@@ -1272,7 +1278,7 @@ fn focus_app_with_indent(script: &mut String, app: &App, indent: &str) -> Result
     if !app.match_criteria.is_empty() {
         writeln!(
             script,
-            "{indent}i3-msg {}",
+            "{indent}i3 {}",
             shell_quote(&format!("[{}] focus", app.match_criteria))
         )?;
         writeln!(script, "{indent}sleep 1")?;
@@ -1302,7 +1308,7 @@ fn detached_exec_command(app: &App, command: &str) -> String {
     format!(
         "sh -lc {}",
         shell_quote(&format!(
-            "setsid -f sh -lc {} >{} 2>&1",
+            "setsid -f sh -lc {} >{} 2>&1 &",
             shell_quote(&format!("exec {command} >>{log_path} 2>&1")),
             shell_word(&detach_log_path)
         ))
@@ -1352,5 +1358,66 @@ fn ensure_executable_path(path: &Path) -> Result<()> {
         Ok(())
     } else {
         Err(format!("not a file: {}", path.display()).into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn two_app_config() -> Config {
+        Config {
+            apps: vec![
+                App {
+                    name: "first".to_string(),
+                    kind: AppKind::Native,
+                    command: "alacritty".to_string(),
+                    args: "--title first".to_string(),
+                    workspace: "1".to_string(),
+                    match_criteria: "title=\"first\"".to_string(),
+                    layout: "move position 0 0".to_string(),
+                    startup_delay: 1,
+                    ..App::default()
+                },
+                App {
+                    name: "second".to_string(),
+                    kind: AppKind::Native,
+                    command: "alacritty".to_string(),
+                    args: "--title second".to_string(),
+                    workspace: "2".to_string(),
+                    match_criteria: "title=\"second\"".to_string(),
+                    layout: "move position 1280 0".to_string(),
+                    startup_delay: 1,
+                    ..App::default()
+                },
+            ],
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn generated_launchers_are_explicitly_backgrounded() {
+        let script = generate_script(&two_app_config()).expect("script should generate");
+
+        assert!(
+            script.contains("setsid -f sh -lc"),
+            "script should use setsid for detached launches"
+        );
+        assert!(
+            script.contains("2>&1 &"),
+            "detached launcher should be backgrounded so later apps can launch"
+        );
+    }
+
+    #[test]
+    fn generated_i3_commands_are_nonfatal() {
+        let script = generate_script(&two_app_config()).expect("script should generate");
+
+        assert!(
+            script.contains("i3() {\n  if ! i3-msg \"$@\"; then"),
+            "script should wrap i3-msg failures"
+        );
+        assert!(script.contains("i3 'exec --no-startup-id"));
+        assert!(script.contains("echo 'launching second'"));
     }
 }
