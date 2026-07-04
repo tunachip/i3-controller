@@ -1,13 +1,18 @@
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const SAMPLE_CONFIG: &str = r#"# i3-controller config
 # Blocks start with [app], [kill], [text], [refresh], or [rerun].
 # Values are key=value. Comments and blank lines are ignored.
+# Text commands support type:literal text, type_env:ENV_VAR, key:KeyName, and wait:2.
 
 [kill]
 name=old chromium sessions
@@ -99,6 +104,7 @@ enum TextCommand {
     Type(String),
     TypeEnv(String),
     Key(String),
+    Wait(u64),
 }
 
 #[derive(Debug, Default)]
@@ -154,6 +160,12 @@ fn main() -> Result<()> {
                 print!("{script}");
             }
         }
+        Some("wizard") => {
+            let path = args
+                .next()
+                .unwrap_or_else(|| "i3-controller.conf".to_string());
+            run_wizard(Path::new(&path))?;
+        }
         Some("help") | Some("--help") | Some("-h") | None => print_help(),
         Some(command) => return Err(format!("unknown command: {command}").into()),
     }
@@ -166,9 +178,567 @@ fn print_help() {
 
     println!("USAGE:");
     println!("  i3-controller init [config]");
+    println!("  i3-controller wizard [config]");
     println!("  i3-controller generate <config> [output]\n");
 
     println!("Generated scripts require i3-msg, xdotool, pkill, and a POSIX shell.");
+    println!(
+        "The wizard can preview layouts from inside i3 and can import Chromium URLs when Chromium exposes a DevTools port."
+    );
+}
+
+fn run_wizard(path: &Path) -> Result<()> {
+    println!("i3-controller interactive config creator\n");
+    println!(
+        "Press Enter to accept defaults. Slow, explicit delays are preferred for lab machines.\n"
+    );
+
+    let mut config =
+        if path.exists() && yes_no(&format!("Load existing {}?", path.display()), true)? {
+            parse_config(&fs::read_to_string(path)?)?
+        } else {
+            Config::default()
+        };
+
+    if yes_no("Add process kill rules before launching apps?", false)? {
+        loop {
+            let pattern = prompt("Process pattern to stop", "")?;
+            if pattern.is_empty() {
+                break;
+            }
+            config.kills.push(KillRule {
+                name: prompt("Friendly name", &pattern)?,
+                pattern,
+                signal: prompt("Signal", "TERM")?,
+            });
+            if !yes_no("Add another kill rule?", false)? {
+                break;
+            }
+        }
+    }
+
+    loop {
+        let name = prompt("App name", "")?;
+        if name.is_empty() {
+            if config.apps.is_empty() {
+                println!("At least one app is required.");
+                continue;
+            }
+            break;
+        }
+
+        let kind = choose("App type", &["web", "native"], "web")?;
+        let mut app = App {
+            name,
+            kind: if kind == "web" {
+                AppKind::Web
+            } else {
+                AppKind::Native
+            },
+            browser: "chromium-browser".to_string(),
+            startup_delay: 5,
+            ..App::default()
+        };
+
+        if app.kind == AppKind::Web {
+            app.browser = prompt("Browser command", "chromium-browser")?;
+            app.url = prompt_required_value("Web app URL", &choose_web_url()?)?;
+            app.profile = prompt(
+                "Dedicated browser profile path",
+                &format!("/tmp/i3-controller-{}", file_safe(&app.name)),
+            )?;
+        } else {
+            app.command = prompt_required("Command")?;
+            app.args = prompt("Arguments", "")?;
+        }
+
+        app.workspace = prompt(
+            "Workspace",
+            &format!("i3-controller-{}", file_safe(&app.name)),
+        )?;
+        app.match_criteria = prompt("i3 match criteria, for example title=\"Dashboard\"", "")?;
+        if app.match_criteria.is_empty() {
+            app.match_criteria = prompt("Window title to match exactly", "")?;
+            if !app.match_criteria.is_empty() {
+                app.match_criteria =
+                    format!("title=\"{}\"", app.match_criteria.replace('"', "\\\""));
+            }
+        }
+        app.layout = prompt(
+            "Layout commands separated by semicolons",
+            "move position 0 0; resize set 1280 720",
+        )?;
+        app.startup_delay = prompt_u64("Seconds to wait after launching", 5)?;
+
+        config.apps.push(app);
+
+        if yes_no("Add login/text-entry automation for this app?", false)? {
+            let app_name = config
+                .apps
+                .last()
+                .expect("app was just pushed")
+                .name
+                .clone();
+            let commands = build_text_commands()?;
+            if !commands.is_empty() {
+                config.text_entries.push(TextEntry {
+                    target: app_name,
+                    delay: prompt_u64("Seconds to wait before text entry starts", 5)?,
+                    commands,
+                });
+            }
+        }
+
+        if yes_no("Add timed refresh/relaunch for this app?", false)? {
+            let app_name = config
+                .apps
+                .last()
+                .expect("app was just pushed")
+                .name
+                .clone();
+            let action = choose("Timed action", &["reload", "relaunch"], "reload")?;
+            config.refreshes.push(TimedEvent {
+                target: app_name,
+                after: parse_duration(&prompt("Run action after", "30m")?)?,
+                action: if action == "relaunch" {
+                    RefreshAction::Relaunch
+                } else {
+                    RefreshAction::Reload
+                },
+                repeat: yes_no("Repeat this timed action forever?", true)?,
+            });
+        }
+
+        if command_exists("i3-msg")
+            && yes_no("Preview current config in an i3 test workspace?", false)?
+        {
+            preview_config(&config)?;
+        }
+
+        if !yes_no("Add another app?", true)? {
+            break;
+        }
+    }
+
+    if yes_no("Rerun the full script on a timer?", false)? {
+        config.rerun = Some(parse_duration(&prompt("Rerun after", "6h")?)?);
+    }
+
+    validate_config(&config)?;
+    let text = config_to_string(&config)?;
+    fs::write(path, text)?;
+    println!("wrote {}", path.display());
+
+    if yes_no("Generate launch script beside the config?", true)? {
+        let script_path = path.with_extension("sh");
+        fs::write(&script_path, generate_script(&config)?)?;
+        println!("wrote {}", script_path.display());
+    }
+
+    Ok(())
+}
+
+fn choose_web_url() -> Result<String> {
+    let urls = chromium_debug_urls();
+    if urls.is_empty() {
+        println!(
+            "No Chromium DevTools URLs found. To enable import, launch Chromium with --remote-debugging-port=9222."
+        );
+        return Ok(String::new());
+    }
+
+    println!("Open Chromium URLs:");
+    for (index, url) in urls.iter().enumerate() {
+        println!("  {}. {}", index + 1, url);
+    }
+    let choice = prompt("Pick a URL number or enter a URL", "1")?;
+    if let Ok(index) = choice.parse::<usize>() {
+        if let Some(url) = urls.get(index.saturating_sub(1)) {
+            return Ok(url.clone());
+        }
+    }
+    Ok(choice)
+}
+
+fn build_text_commands() -> Result<Vec<TextCommand>> {
+    println!("Build text-entry steps. Use explicit waits when pages are slow.");
+    println!("Step types: type, env, key, wait, record, done.");
+    println!("Recording uses xinput/xmodmap when available and stops when you press End.\n");
+
+    let mut commands = Vec::new();
+    loop {
+        let step = choose(
+            "Step type",
+            &["type", "key", "wait", "env", "record", "done"],
+            "key",
+        )?;
+        match step.as_str() {
+            "type" => commands.push(TextCommand::Type(prompt("Text to type", "")?)),
+            "env" => {
+                let name = prompt("Environment variable name", "")?;
+                validate_env_name(&name)?;
+                commands.push(TextCommand::TypeEnv(name));
+            }
+            "key" => commands.push(TextCommand::Key(prompt("xdotool key name", "Tab")?)),
+            "wait" => commands.push(TextCommand::Wait(prompt_u64("Wait seconds", 2)?)),
+            "record" => commands.extend(record_key_commands()?),
+            "done" => break,
+            _ => unreachable!(),
+        }
+    }
+    Ok(commands)
+}
+
+fn record_key_commands() -> Result<Vec<TextCommand>> {
+    if !command_exists("xinput") || !command_exists("xmodmap") {
+        println!("Recording requires xinput and xmodmap. Add key steps manually on this machine.");
+        return Ok(Vec::new());
+    }
+
+    println!("Focus the target app, then press Enter here to start recording.");
+    println!("Press End to finish recording. Add wait steps afterward if the app needs time.");
+    let mut ignored = String::new();
+    io::stdin().read_line(&mut ignored)?;
+
+    let keymap = x_keymap()?;
+    let mut child = Command::new("xinput")
+        .args(["test-xi2", "--root"])
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().ok_or("failed to read xinput output")?;
+    let reader = BufReader::new(stdout);
+    let mut commands = Vec::new();
+    let mut key_press = false;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.contains("(KeyPress)") || line.contains("RawKeyPress") {
+            key_press = true;
+            continue;
+        }
+        if !key_press {
+            continue;
+        }
+        let Some(code) = parse_xinput_detail(&line) else {
+            continue;
+        };
+        key_press = false;
+        let key = keymap.get(&code).cloned().unwrap_or(code);
+        if key == "End" {
+            let _ = child.kill();
+            let _ = child.wait();
+            println!("Recorded {} key steps.", commands.len());
+            return Ok(commands);
+        }
+        if !is_modifier_key(&key) {
+            commands.push(TextCommand::Key(key));
+        }
+    }
+
+    let _ = child.wait();
+    Ok(commands)
+}
+
+fn x_keymap() -> Result<std::collections::HashMap<String, String>> {
+    let output = Command::new("xmodmap").arg("-pke").output()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut map = std::collections::HashMap::new();
+    for line in text.lines() {
+        let Some((left, right)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(code) = left.split_whitespace().nth(1) else {
+            continue;
+        };
+        let Some(name) = right.split_whitespace().find(|name| *name != "NoSymbol") else {
+            continue;
+        };
+        map.insert(code.to_string(), name.to_string());
+    }
+    Ok(map)
+}
+
+fn parse_xinput_detail(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let value = trimmed.strip_prefix("detail:")?.trim();
+    value.split_whitespace().next().map(str::to_string)
+}
+
+fn is_modifier_key(key: &str) -> bool {
+    matches!(
+        key,
+        "Shift_L"
+            | "Shift_R"
+            | "Control_L"
+            | "Control_R"
+            | "Alt_L"
+            | "Alt_R"
+            | "Meta_L"
+            | "Meta_R"
+            | "Super_L"
+            | "Super_R"
+    )
+}
+
+fn preview_config(config: &Config) -> Result<()> {
+    let workspace = "i3-controller-preview";
+    let preview_path = env::temp_dir().join("i3-controller-preview.sh");
+    let mut preview = Config {
+        apps: Vec::new(),
+        kills: Vec::new(),
+        text_entries: Vec::new(),
+        refreshes: Vec::new(),
+        rerun: None,
+    };
+    for app in &config.apps {
+        preview.apps.push(App {
+            name: app.name.clone(),
+            kind: if app.kind == AppKind::Web {
+                AppKind::Web
+            } else {
+                AppKind::Native
+            },
+            command: app.command.clone(),
+            args: app.args.clone(),
+            url: app.url.clone(),
+            browser: app.browser.clone(),
+            profile: app.profile.clone(),
+            workspace: workspace.to_string(),
+            match_criteria: app.match_criteria.clone(),
+            layout: app.layout.clone(),
+            startup_delay: app.startup_delay,
+        });
+    }
+    fs::write(&preview_path, generate_script(&preview)?)?;
+    println!("Switching to workspace {workspace} and running a preview.");
+    let _ = Command::new("i3-msg")
+        .arg(format!("workspace {workspace}"))
+        .status();
+    Command::new("sh").arg(&preview_path).status()?;
+    println!("Preview launched. Inspect the workspace before finalizing.");
+    Ok(())
+}
+
+fn config_to_string(config: &Config) -> Result<String> {
+    let mut output = String::new();
+    writeln!(output, "# i3-controller config")?;
+    writeln!(output, "# Created by `i3-controller wizard`.")?;
+    writeln!(output)?;
+
+    for kill in &config.kills {
+        writeln!(output, "[kill]")?;
+        write_pair(&mut output, "name", &kill.name)?;
+        write_pair(&mut output, "pattern", &kill.pattern)?;
+        write_pair(&mut output, "signal", &kill.signal)?;
+        writeln!(output)?;
+    }
+
+    for app in &config.apps {
+        writeln!(output, "[app]")?;
+        write_pair(&mut output, "name", &app.name)?;
+        write_pair(
+            &mut output,
+            "kind",
+            if app.kind == AppKind::Web {
+                "web"
+            } else {
+                "native"
+            },
+        )?;
+        match app.kind {
+            AppKind::Web => {
+                write_pair(&mut output, "url", &app.url)?;
+                write_pair(&mut output, "browser", &app.browser)?;
+                write_pair(&mut output, "profile", &app.profile)?;
+            }
+            AppKind::Native => {
+                write_pair(&mut output, "command", &app.command)?;
+                write_pair(&mut output, "args", &app.args)?;
+            }
+        }
+        write_pair(&mut output, "workspace", &app.workspace)?;
+        write_pair(&mut output, "match", &app.match_criteria)?;
+        write_pair(&mut output, "layout", &app.layout)?;
+        write_pair(&mut output, "startup_delay", &app.startup_delay.to_string())?;
+        writeln!(output)?;
+    }
+
+    for entry in &config.text_entries {
+        writeln!(output, "[text]")?;
+        write_pair(&mut output, "target", &entry.target)?;
+        write_pair(&mut output, "delay", &entry.delay.to_string())?;
+        write_pair(
+            &mut output,
+            "commands",
+            &text_commands_to_string(&entry.commands),
+        )?;
+        writeln!(output)?;
+    }
+
+    for event in &config.refreshes {
+        writeln!(output, "[refresh]")?;
+        write_pair(&mut output, "target", &event.target)?;
+        write_pair(&mut output, "after", &event.after.raw)?;
+        write_pair(
+            &mut output,
+            "action",
+            if event.action == RefreshAction::Relaunch {
+                "relaunch"
+            } else {
+                "reload"
+            },
+        )?;
+        write_pair(
+            &mut output,
+            "repeat",
+            if event.repeat { "true" } else { "false" },
+        )?;
+        writeln!(output)?;
+    }
+
+    if let Some(rerun) = &config.rerun {
+        writeln!(output, "[rerun]")?;
+        write_pair(&mut output, "after", &rerun.raw)?;
+    }
+
+    Ok(output)
+}
+
+fn write_pair(output: &mut String, key: &str, value: &str) -> Result<()> {
+    if !value.is_empty() {
+        writeln!(output, "{key}={value}")?;
+    }
+    Ok(())
+}
+
+fn text_commands_to_string(commands: &[TextCommand]) -> String {
+    commands
+        .iter()
+        .map(|command| match command {
+            TextCommand::Type(text) => format!("type:{text}"),
+            TextCommand::TypeEnv(name) => format!("type_env:{name}"),
+            TextCommand::Key(key) => format!("key:{key}"),
+            TextCommand::Wait(seconds) => format!("wait:{seconds}"),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn chromium_debug_urls() -> Vec<String> {
+    let Ok(mut stream) = TcpStream::connect("127.0.0.1:9222") else {
+        return Vec::new();
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(700)));
+    let _ = stream
+        .write_all(b"GET /json HTTP/1.1\r\nHost: 127.0.0.1:9222\r\nConnection: close\r\n\r\n");
+    let mut response = String::new();
+    if stream.read_to_string(&mut response).is_err() {
+        return Vec::new();
+    }
+
+    let mut urls = Vec::new();
+    let mut rest = response.as_str();
+    while let Some(start) = rest.find("\"url\"") {
+        rest = &rest[start + 5..];
+        let Some(colon) = rest.find(':') else { break };
+        rest = rest[colon + 1..].trim_start();
+        if !rest.starts_with('"') {
+            continue;
+        }
+        rest = &rest[1..];
+        let Some(end) = rest.find('"') else { break };
+        let url = unescape_json_string(&rest[..end]);
+        rest = &rest[end + 1..];
+        if url.starts_with("http://") || url.starts_with("https://") {
+            urls.push(url);
+        }
+    }
+    urls.sort();
+    urls.dedup();
+    urls
+}
+
+fn unescape_json_string(value: &str) -> String {
+    value
+        .replace("\\/", "/")
+        .replace("\\\"", "\"")
+        .replace("\\\\", "\\")
+}
+
+fn prompt(label: &str, default: &str) -> Result<String> {
+    if default.is_empty() {
+        print!("{label}: ");
+    } else {
+        print!("{label} [{default}]: ");
+    }
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let value = input.trim();
+    if value.is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn prompt_required(label: &str) -> Result<String> {
+    prompt_required_value(label, "")
+}
+
+fn prompt_required_value(label: &str, default: &str) -> Result<String> {
+    loop {
+        let value = prompt(label, default)?;
+        if !value.trim().is_empty() {
+            return Ok(value);
+        }
+        println!("{label} is required.");
+    }
+}
+
+fn prompt_u64(label: &str, default: u64) -> Result<u64> {
+    loop {
+        let value = prompt(label, &default.to_string())?;
+        match value.parse() {
+            Ok(number) => return Ok(number),
+            Err(_) => println!("Enter a whole number."),
+        }
+    }
+}
+
+fn yes_no(label: &str, default: bool) -> Result<bool> {
+    let default_text = if default { "Y/n" } else { "y/N" };
+    loop {
+        let value = prompt(label, default_text)?;
+        match value.to_ascii_lowercase().as_str() {
+            "" => return Ok(default),
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            "y/n" => return Ok(default),
+            _ => println!("Answer yes or no."),
+        }
+    }
+}
+
+fn choose(label: &str, choices: &[&str], default: &str) -> Result<String> {
+    loop {
+        let value = prompt(&format!("{label} ({})", choices.join("/")), default)?;
+        if choices.contains(&value.as_str()) {
+            return Ok(value);
+        }
+        println!("Choose one of: {}", choices.join(", "));
+    }
+}
+
+fn command_exists(command: &str) -> bool {
+    env::var_os("PATH")
+        .and_then(|paths| {
+            env::split_paths(&paths)
+                .map(|path| path.join(command))
+                .find(|path| path.is_file())
+        })
+        .is_some()
 }
 
 fn parse_config(input: &str) -> Result<Config> {
@@ -200,10 +770,9 @@ fn parse_config(input: &str) -> Result<Config> {
             return Err(format!("line {} appears before a block header", index + 1).into());
         };
 
-        block.pairs.push((
-            key.trim().to_ascii_lowercase(),
-            value.trim().to_string()
-        ));
+        block
+            .pairs
+            .push((key.trim().to_ascii_lowercase(), value.trim().to_string()));
     }
 
     if let Some(block) = current {
@@ -213,12 +782,12 @@ fn parse_config(input: &str) -> Result<Config> {
     let mut config = Config::default();
     for block in blocks {
         match block.name.as_str() {
-            "app"     => config.apps.push(parse_app(&block)?),
-            "kill"    => config.kills.push(parse_kill(&block)?),
-            "text"    => config.text_entries.push(parse_text_entry(&block)?),
+            "app" => config.apps.push(parse_app(&block)?),
+            "kill" => config.kills.push(parse_kill(&block)?),
+            "text" => config.text_entries.push(parse_text_entry(&block)?),
             "refresh" => config.refreshes.push(parse_timed_event(&block)?),
-            "rerun"   => config.rerun = Some(parse_rerun(&block)?),
-            other     => return Err(format!("unknown block [{other}]").into()),
+            "rerun" => config.rerun = Some(parse_rerun(&block)?),
+            other => return Err(format!("unknown block [{other}]").into()),
         }
     }
 
@@ -238,18 +807,18 @@ fn parse_app(block: &Block) -> Result<App> {
             "kind" => {
                 app.kind = match value.to_ascii_lowercase().as_str() {
                     "native" => AppKind::Native,
-                    "web"    => AppKind::Web,
+                    "web" => AppKind::Web,
                     _ => return Err(format!("unknown app kind for {}: {value}", app.name).into()),
                 }
             }
-            "command"       => app.command = value.clone(),
-            "args"          => app.args = value.clone(),
-            "url"           => app.url = value.clone(),
-            "browser"       => app.browser = value.clone(),
-            "profile"       => app.profile = value.clone(),
-            "workspace"     => app.workspace = value.clone(),
-            "match"         => app.match_criteria = value.clone(),
-            "layout"        => app.layout = value.clone(),
+            "command" => app.command = value.clone(),
+            "args" => app.args = value.clone(),
+            "url" => app.url = value.clone(),
+            "browser" => app.browser = value.clone(),
+            "profile" => app.profile = value.clone(),
+            "workspace" => app.workspace = value.clone(),
+            "match" => app.match_criteria = value.clone(),
+            "layout" => app.layout = value.clone(),
             "startup_delay" => app.startup_delay = value.parse()?,
             _ => return Err(format!("unknown app key for {}: {key}", app.name).into()),
         }
@@ -280,10 +849,10 @@ fn parse_kill(block: &Block) -> Result<KillRule> {
 
     for (key, value) in &block.pairs {
         match key.as_str() {
-            "name"    => kill.name = value.clone(),
+            "name" => kill.name = value.clone(),
             "pattern" => kill.pattern = value.clone(),
-            "signal"  => kill.signal = value.clone(),
-            _         => return Err(format!("unknown kill key: {key}").into()),
+            "signal" => kill.signal = value.clone(),
+            _ => return Err(format!("unknown kill key: {key}").into()),
         }
     }
 
@@ -299,10 +868,10 @@ fn parse_text_entry(block: &Block) -> Result<TextEntry> {
 
     for (key, value) in &block.pairs {
         match key.as_str() {
-            "target"   => entry.target = value.clone(),
-            "delay"    => entry.delay = value.parse()?,
+            "target" => entry.target = value.clone(),
+            "delay" => entry.delay = value.parse()?,
             "commands" => entry.commands = parse_text_commands(value)?,
-            _          => return Err(format!("unknown text key: {key}").into()),
+            _ => return Err(format!("unknown text key: {key}").into()),
         }
     }
 
@@ -322,12 +891,12 @@ fn parse_timed_event(block: &Block) -> Result<TimedEvent> {
     for (key, value) in &block.pairs {
         match key.as_str() {
             "target" => event.target = value.clone(),
-            "after"  => event.after = parse_duration(value)?,
+            "after" => event.after = parse_duration(value)?,
             "action" => {
                 event.action = match value.to_ascii_lowercase().as_str() {
-                    "reload"   => RefreshAction::Reload,
+                    "reload" => RefreshAction::Reload,
                     "relaunch" => RefreshAction::Relaunch,
-                    _          => return Err(format!("unknown refresh action: {value}").into()),
+                    _ => return Err(format!("unknown refresh action: {value}").into()),
                 }
             }
             "repeat" => event.repeat = parse_bool(value)?,
@@ -367,10 +936,11 @@ fn parse_text_commands(value: &str) -> Result<Vec<TextCommand>> {
             return Err(format!("text command must be kind:value: {segment}").into());
         };
         match kind.trim().to_ascii_lowercase().as_str() {
-            "type"     => commands.push(TextCommand::Type(payload.trim().to_string())),
+            "type" => commands.push(TextCommand::Type(payload.trim().to_string())),
             "type_env" => commands.push(TextCommand::TypeEnv(payload.trim().to_string())),
-            "key"      => commands.push(TextCommand::Key(payload.trim().to_string())),
-            _          => return Err(format!("unknown text command: {kind}").into()),
+            "key" => commands.push(TextCommand::Key(payload.trim().to_string())),
+            "wait" => commands.push(TextCommand::Wait(payload.trim().parse()?)),
+            _ => return Err(format!("unknown text command: {kind}").into()),
         }
     }
     Ok(commands)
@@ -403,6 +973,20 @@ fn parse_bool(value: &str) -> Result<bool> {
 }
 
 fn validate_config(config: &Config) -> Result<()> {
+    for app in &config.apps {
+        if app.name.is_empty() {
+            return Err("[app] requires name".into());
+        }
+        match app.kind {
+            AppKind::Native if app.command.is_empty() => {
+                return Err(format!("app {} requires command", app.name).into());
+            }
+            AppKind::Web if app.url.is_empty() => {
+                return Err(format!("web app {} requires url", app.name).into());
+            }
+            _ => {}
+        }
+    }
     for entry in &config.text_entries {
         find_app(config, &entry.target)?;
     }
@@ -574,6 +1158,7 @@ fn write_text_entry(script: &mut String, app: &App, entry: &TextEntry) -> Result
                 writeln!(script, "  xdotool type --delay 20 -- \"${{{name}:-}}\"")?;
             }
             TextCommand::Key(key) => writeln!(script, "  xdotool key {}", shell_word(key))?,
+            TextCommand::Wait(seconds) => writeln!(script, "  sleep {seconds}")?,
         }
     }
     writeln!(
