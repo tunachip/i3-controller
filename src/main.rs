@@ -1044,6 +1044,28 @@ fn generate_script(config: &Config) -> Result<String> {
     writeln!(script, "  fi")?;
     writeln!(script, "}}")?;
     writeln!(script)?;
+    writeln!(script, "i3_match() {{")?;
+    writeln!(script, "  criteria=$1")?;
+    writeln!(script, "  command=$2")?;
+    writeln!(script, "  attempts=${{3:-30}}")?;
+    writeln!(script, "  output=")?;
+    writeln!(script, "  while [ \"$attempts\" -gt 0 ]; do")?;
+    writeln!(
+        script,
+        "    if output=$(i3-msg \"[$criteria] $command\" 2>&1); then"
+    )?;
+    writeln!(script, "      return 0")?;
+    writeln!(script, "    fi")?;
+    writeln!(script, "    attempts=$((attempts - 1))")?;
+    writeln!(script, "    [ \"$attempts\" -gt 0 ] && sleep 1")?;
+    writeln!(script, "  done")?;
+    writeln!(
+        script,
+        "  echo \"i3-controller: i3 command failed for [$criteria]: $command\" >&2"
+    )?;
+    writeln!(script, "  [ -n \"$output\" ] && echo \"$output\" >&2")?;
+    writeln!(script, "}}")?;
+    writeln!(script)?;
 
     for kill in &config.kills {
         let label = if kill.name.is_empty() {
@@ -1143,11 +1165,9 @@ fn write_launch_app(script: &mut String, app: &App) -> Result<()> {
         if !app.workspace.is_empty() {
             writeln!(
                 script,
-                "i3 {}",
-                shell_quote(&format!(
-                    "[{}] move to workspace {}",
-                    app.match_criteria, app.workspace
-                ))
+                "i3_match {} {}",
+                shell_quote(&app.match_criteria),
+                shell_quote(&format!("move to workspace {}", app.workspace))
             )?;
         }
         for command in app
@@ -1158,8 +1178,9 @@ fn write_launch_app(script: &mut String, app: &App) -> Result<()> {
         {
             writeln!(
                 script,
-                "i3 {}",
-                shell_quote(&format!("[{}] {command}", app.match_criteria))
+                "i3_match {} {}",
+                shell_quote(&app.match_criteria),
+                shell_quote(command)
             )?;
         }
     }
@@ -1278,8 +1299,9 @@ fn focus_app_with_indent(script: &mut String, app: &App, indent: &str) -> Result
     if !app.match_criteria.is_empty() {
         writeln!(
             script,
-            "{indent}i3 {}",
-            shell_quote(&format!("[{}] focus", app.match_criteria))
+            "{indent}i3_match {} {}",
+            shell_quote(&app.match_criteria),
+            shell_quote("focus")
         )?;
         writeln!(script, "{indent}sleep 1")?;
     }
@@ -1417,6 +1439,11 @@ mod tests {
             script.contains("i3() {\n  if ! i3-msg \"$@\"; then"),
             "script should wrap i3-msg failures"
         );
+        assert!(
+            script.contains("i3_match() {"),
+            "script should include retry helper for window criteria"
+        );
+        assert!(script.contains("i3_match 'title=\"first\"' 'move to workspace 1'"));
         assert!(script.contains("i3 'exec --no-startup-id"));
         assert!(script.contains("echo 'launching second'"));
     }
