@@ -1128,6 +1128,16 @@ fn generate_script(config: &Config) -> Result<String> {
     writeln!(script, "walk(tree)' \"$mark\"")?;
     writeln!(script, "}}")?;
     writeln!(script)?;
+    writeln!(script, "i3_set_window_name() {{")?;
+    writeln!(script, "  window_id=$1")?;
+    writeln!(script, "  name=$2")?;
+    writeln!(script, "  [ -n \"$name\" ] || return 0")?;
+    writeln!(
+        script,
+        "  xdotool set_window --name \"$name\" \"$window_id\" >/dev/null 2>&1 || true"
+    )?;
+    writeln!(script, "}}")?;
+    writeln!(script)?;
     writeln!(script, "i3_try_match() {{")?;
     writeln!(script, "  criteria=$1")?;
     writeln!(script, "  command=$2")?;
@@ -1188,7 +1198,8 @@ fn generate_script(config: &Config) -> Result<String> {
     writeln!(script, "  mark=$1")?;
     writeln!(script, "  before_file=$2")?;
     writeln!(script, "  criteria=$3")?;
-    writeln!(script, "  attempts=${{4:-30}}")?;
+    writeln!(script, "  display_name=$4")?;
+    writeln!(script, "  attempts=${{5:-30}}")?;
     writeln!(script, "  while [ \"$attempts\" -gt 0 ]; do")?;
     writeln!(script, "    for window_id in $(i3_window_ids); do")?;
     writeln!(
@@ -1217,6 +1228,10 @@ fn generate_script(config: &Config) -> Result<String> {
     writeln!(
         script,
         "        echo \"$window_id\" > \"$STATE_DIR/$mark.window\""
+    )?;
+    writeln!(
+        script,
+        "        i3_set_window_name \"$window_id\" \"$display_name\""
     )?;
     writeln!(script, "        return 0")?;
     writeln!(script, "      fi")?;
@@ -1401,10 +1416,11 @@ fn write_launch_app(script: &mut String, app: &App) -> Result<()> {
     }
     writeln!(
         script,
-        "i3_mark_new_window {} \"$STATE_DIR/{}-before.windows\" {} {}",
+        "i3_mark_new_window {} \"$STATE_DIR/{}-before.windows\" {} {} {}",
         shell_quote(&mark),
         file_safe(&app.name),
-        shell_quote(app.match_criteria.trim()),
+        shell_quote(launch_match_criteria(app)),
+        shell_quote(launch_display_name(app)),
         app.startup_delay.max(30)
     )?;
 
@@ -1626,6 +1642,25 @@ fn layout_requires_floating(layout: &str) -> bool {
         .any(|command| command.starts_with("move position") || command.starts_with("resize set"))
 }
 
+fn launch_match_criteria(app: &App) -> &str {
+    // Browser app windows often appear before Chromium has set a page title.
+    // The pre-launch window snapshot is the stable identifier; configured match
+    // criteria remain useful later as a fallback if the i3 mark is lost.
+    if app.kind == AppKind::Web {
+        ""
+    } else {
+        app.match_criteria.trim()
+    }
+}
+
+fn launch_display_name(app: &App) -> &str {
+    if app.kind == AppKind::Web {
+        &app.name
+    } else {
+        ""
+    }
+}
+
 fn window_mark(app: &App) -> String {
     format!("i3-controller-{}", file_safe(&app.name))
 }
@@ -1790,7 +1825,7 @@ mod tests {
 
         assert!(script.contains("command -v python3"));
         assert!(script.contains(
-            "i3_mark_new_window 'i3-controller-first' \"$STATE_DIR/first-before.windows\" 'title=\"first\"' 30"
+            "i3_mark_new_window 'i3-controller-first' \"$STATE_DIR/first-before.windows\" 'title=\"first\"' '' 30"
         ));
         assert!(script.contains(
             "window_id=$(i3_focus_app 'i3-controller-first' 'title=\"first\"' 30) || exit 1"
@@ -1814,5 +1849,34 @@ mod tests {
             launch_second < arrange_first,
             "all apps should launch before any matched layout commands run"
         );
+    }
+
+    #[test]
+    fn generated_web_launch_marks_new_window_without_title_match() {
+        let config = Config {
+            apps: vec![App {
+                name: "dashboard".to_string(),
+                kind: AppKind::Web,
+                url: "https://example.test/dashboard".to_string(),
+                browser: "chromium-browser".to_string(),
+                profile: "/tmp/i3-controller-dashboard".to_string(),
+                workspace: "1".to_string(),
+                match_criteria: "title=\"Dashboard\"".to_string(),
+                layout: "move position 0 0".to_string(),
+                startup_delay: 1,
+                ..App::default()
+            }],
+            ..Config::default()
+        };
+
+        let script = generate_script(&config).expect("script should generate");
+
+        assert!(script.contains("i3_set_window_name() {"));
+        assert!(script.contains(
+            "i3_mark_new_window 'i3-controller-dashboard' \"$STATE_DIR/dashboard-before.windows\" '' 'dashboard' 30"
+        ));
+        assert!(script.contains(
+            "i3_app 'i3-controller-dashboard' 'title=\"Dashboard\"' 'move to workspace 1'"
+        ));
     }
 }
