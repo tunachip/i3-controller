@@ -1044,26 +1044,100 @@ fn generate_script(config: &Config) -> Result<String> {
     writeln!(script, "  fi")?;
     writeln!(script, "}}")?;
     writeln!(script)?;
-    writeln!(script, "i3_match() {{")?;
+    writeln!(script, "i3_window_ids() {{")?;
+    writeln!(
+        script,
+        "  i3-msg -t get_tree | tr ',{{}}' '\\n\\n\\n' | sed -n 's/.*\"window\":[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p'"
+    )?;
+    writeln!(script, "}}")?;
+    writeln!(script)?;
+    writeln!(script, "i3_try_match() {{")?;
     writeln!(script, "  criteria=$1")?;
     writeln!(script, "  command=$2")?;
     writeln!(script, "  attempts=${{3:-30}}")?;
-    writeln!(script, "  output=")?;
+    writeln!(script, "  I3_MATCH_OUTPUT=")?;
     writeln!(script, "  while [ \"$attempts\" -gt 0 ]; do")?;
     writeln!(
         script,
-        "    if output=$(i3-msg \"[$criteria] $command\" 2>&1); then"
+        "    if I3_MATCH_OUTPUT=$(i3-msg \"[$criteria] $command\" 2>&1); then"
     )?;
     writeln!(script, "      return 0")?;
     writeln!(script, "    fi")?;
     writeln!(script, "    attempts=$((attempts - 1))")?;
     writeln!(script, "    [ \"$attempts\" -gt 0 ] && sleep 1")?;
     writeln!(script, "  done")?;
+    writeln!(script, "  return 1")?;
+    writeln!(script, "}}")?;
+    writeln!(script)?;
+    writeln!(script, "i3_match() {{")?;
+    writeln!(script, "  if ! i3_try_match \"$@\"; then")?;
     writeln!(
         script,
-        "  echo \"i3-controller: i3 command failed for [$criteria]: $command\" >&2"
+        "    echo \"i3-controller: i3 command failed for [$1]: $2\" >&2"
     )?;
-    writeln!(script, "  [ -n \"$output\" ] && echo \"$output\" >&2")?;
+    writeln!(
+        script,
+        "    [ -n \"$I3_MATCH_OUTPUT\" ] && echo \"$I3_MATCH_OUTPUT\" >&2"
+    )?;
+    writeln!(script, "  fi")?;
+    writeln!(script, "}}")?;
+    writeln!(script)?;
+    writeln!(script, "i3_app() {{")?;
+    writeln!(script, "  mark=$1")?;
+    writeln!(script, "  fallback=$2")?;
+    writeln!(script, "  command=$3")?;
+    writeln!(script, "  attempts=${{4:-30}}")?;
+    writeln!(
+        script,
+        "  if i3_try_match \"con_mark=\\\"$mark\\\"\" \"$command\" \"$attempts\"; then"
+    )?;
+    writeln!(script, "    return 0")?;
+    writeln!(script, "  fi")?;
+    writeln!(script, "  if [ -n \"$fallback\" ]; then")?;
+    writeln!(
+        script,
+        "    i3_match \"$fallback\" \"$command\" \"$attempts\""
+    )?;
+    writeln!(script, "  else")?;
+    writeln!(
+        script,
+        "    echo \"i3-controller: no marked window found for $mark: $command\" >&2"
+    )?;
+    writeln!(
+        script,
+        "    [ -n \"$I3_MATCH_OUTPUT\" ] && echo \"$I3_MATCH_OUTPUT\" >&2"
+    )?;
+    writeln!(script, "  fi")?;
+    writeln!(script, "}}")?;
+    writeln!(script)?;
+    writeln!(script, "i3_mark_new_window() {{")?;
+    writeln!(script, "  mark=$1")?;
+    writeln!(script, "  before_file=$2")?;
+    writeln!(script, "  attempts=${{3:-30}}")?;
+    writeln!(script, "  while [ \"$attempts\" -gt 0 ]; do")?;
+    writeln!(script, "    for window_id in $(i3_window_ids); do")?;
+    writeln!(
+        script,
+        "      if ! grep -qx \"$window_id\" \"$before_file\" 2>/dev/null; then"
+    )?;
+    writeln!(
+        script,
+        "        i3 \"[id=\\\"$window_id\\\"] mark --replace $mark\""
+    )?;
+    writeln!(
+        script,
+        "        echo \"$window_id\" > \"$STATE_DIR/$mark.window\""
+    )?;
+    writeln!(script, "        return 0")?;
+    writeln!(script, "      fi")?;
+    writeln!(script, "    done")?;
+    writeln!(script, "    attempts=$((attempts - 1))")?;
+    writeln!(script, "    [ \"$attempts\" -gt 0 ] && sleep 1")?;
+    writeln!(script, "  done")?;
+    writeln!(
+        script,
+        "  echo \"i3-controller: failed to identify new window for $mark\" >&2"
+    )?;
     writeln!(script, "}}")?;
     writeln!(script)?;
 
@@ -1123,6 +1197,12 @@ fn write_launch_app(script: &mut String, app: &App) -> Result<()> {
         "echo {}",
         shell_quote(&format!("launching {}", app.name))
     )?;
+    let mark = window_mark(app);
+    writeln!(
+        script,
+        "i3_window_ids > \"$STATE_DIR/{}-before.windows\"",
+        file_safe(&app.name)
+    )?;
     if !app.workspace.is_empty() {
         writeln!(
             script,
@@ -1161,13 +1241,22 @@ fn write_launch_app(script: &mut String, app: &App) -> Result<()> {
             )?;
         }
     }
+    writeln!(
+        script,
+        "i3_mark_new_window {} \"$STATE_DIR/{}-before.windows\" {}",
+        shell_quote(&mark),
+        file_safe(&app.name),
+        app.startup_delay.max(30)
+    )?;
 
     writeln!(script)?;
     Ok(())
 }
 
 fn write_configure_app(script: &mut String, app: &App) -> Result<()> {
-    if !app.match_criteria.is_empty() {
+    let mark = window_mark(app);
+    let fallback = app.match_criteria.trim();
+    if !app.match_criteria.is_empty() || !app.layout.is_empty() || !app.workspace.is_empty() {
         writeln!(
             script,
             "echo {}",
@@ -1177,23 +1266,26 @@ fn write_configure_app(script: &mut String, app: &App) -> Result<()> {
         writeln!(script, "sleep {delay}")?;
         writeln!(
             script,
-            "i3_match {} {}",
-            shell_quote(&app.match_criteria),
+            "i3_app {} {} {}",
+            shell_quote(&mark),
+            shell_quote(fallback),
             shell_quote("nop")
         )?;
         if !app.workspace.is_empty() {
             writeln!(
                 script,
-                "i3_match {} {}",
-                shell_quote(&app.match_criteria),
+                "i3_app {} {} {}",
+                shell_quote(&mark),
+                shell_quote(fallback),
                 shell_quote(&format!("move to workspace {}", app.workspace))
             )?;
         }
         if layout_requires_floating(&app.layout) {
             writeln!(
                 script,
-                "i3_match {} {}",
-                shell_quote(&app.match_criteria),
+                "i3_app {} {} {}",
+                shell_quote(&mark),
+                shell_quote(fallback),
                 shell_quote("floating enable")
             )?;
         }
@@ -1205,8 +1297,9 @@ fn write_configure_app(script: &mut String, app: &App) -> Result<()> {
         {
             writeln!(
                 script,
-                "i3_match {} {}",
-                shell_quote(&app.match_criteria),
+                "i3_app {} {} {}",
+                shell_quote(&mark),
+                shell_quote(fallback),
                 shell_quote(command)
             )?;
         }
@@ -1325,11 +1418,12 @@ fn focus_app(script: &mut String, app: &App) -> Result<()> {
 }
 
 fn focus_app_with_indent(script: &mut String, app: &App, indent: &str) -> Result<()> {
-    if !app.match_criteria.is_empty() {
+    if !app.match_criteria.is_empty() || !app.name.is_empty() {
         writeln!(
             script,
-            "{indent}i3_match {} {}",
-            shell_quote(&app.match_criteria),
+            "{indent}i3_app {} {} {}",
+            shell_quote(&window_mark(app)),
+            shell_quote(app.match_criteria.trim()),
             shell_quote("focus")
         )?;
         writeln!(script, "{indent}sleep 1")?;
@@ -1359,6 +1453,10 @@ fn layout_requires_floating(layout: &str) -> bool {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .any(|command| command.starts_with("move position") || command.starts_with("resize set"))
+}
+
+fn window_mark(app: &App) -> String {
+    format!("i3-controller-{}", file_safe(&app.name))
 }
 
 fn detached_exec_command(app: &App, command: &str) -> String {
@@ -1480,9 +1578,18 @@ mod tests {
             script.contains("i3_match() {"),
             "script should include retry helper for window criteria"
         );
-        assert!(script.contains("i3_match 'title=\"first\"' 'nop'"));
-        assert!(script.contains("i3_match 'title=\"first\"' 'floating enable'"));
-        assert!(script.contains("i3_match 'title=\"first\"' 'move to workspace 1'"));
+        assert!(
+            script.contains("i3_mark_new_window() {"),
+            "script should identify and mark newly launched windows"
+        );
+        assert!(script.contains("i3_mark_new_window 'i3-controller-first'"));
+        assert!(script.contains("i3_app 'i3-controller-first' 'title=\"first\"' 'nop'"));
+        assert!(
+            script.contains("i3_app 'i3-controller-first' 'title=\"first\"' 'floating enable'")
+        );
+        assert!(
+            script.contains("i3_app 'i3-controller-first' 'title=\"first\"' 'move to workspace 1'")
+        );
         assert!(script.contains("i3 'exec --no-startup-id"));
         assert!(script.contains("echo 'launching second'"));
     }
