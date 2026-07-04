@@ -1090,6 +1090,10 @@ fn generate_script(config: &Config) -> Result<String> {
         write_launch_app(&mut script, app)?;
     }
 
+    for app in &config.apps {
+        write_configure_app(&mut script, app)?;
+    }
+
     for entry in &config.text_entries {
         let app = find_app(config, &entry.target)?;
         write_text_entry(&mut script, app, entry)?;
@@ -1158,16 +1162,39 @@ fn write_launch_app(script: &mut String, app: &App) -> Result<()> {
         }
     }
 
-    let delay = app.startup_delay.max(1);
-    writeln!(script, "sleep {delay}")?;
+    writeln!(script)?;
+    Ok(())
+}
 
+fn write_configure_app(script: &mut String, app: &App) -> Result<()> {
     if !app.match_criteria.is_empty() {
+        writeln!(
+            script,
+            "echo {}",
+            shell_quote(&format!("arranging {}", app.name))
+        )?;
+        let delay = app.startup_delay.max(1);
+        writeln!(script, "sleep {delay}")?;
+        writeln!(
+            script,
+            "i3_match {} {}",
+            shell_quote(&app.match_criteria),
+            shell_quote("nop")
+        )?;
         if !app.workspace.is_empty() {
             writeln!(
                 script,
                 "i3_match {} {}",
                 shell_quote(&app.match_criteria),
                 shell_quote(&format!("move to workspace {}", app.workspace))
+            )?;
+        }
+        if layout_requires_floating(&app.layout) {
+            writeln!(
+                script,
+                "i3_match {} {}",
+                shell_quote(&app.match_criteria),
+                shell_quote("floating enable")
             )?;
         }
         for command in app
@@ -1183,9 +1210,9 @@ fn write_launch_app(script: &mut String, app: &App) -> Result<()> {
                 shell_quote(command)
             )?;
         }
+        writeln!(script)?;
     }
 
-    writeln!(script)?;
     Ok(())
 }
 
@@ -1286,6 +1313,8 @@ fn write_refresh_body(
             }
             write!(script, "{indent}")?;
             write_launch_app(script, app)?;
+            write!(script, "{indent}")?;
+            write_configure_app(script, app)?;
         }
     }
     Ok(())
@@ -1322,6 +1351,14 @@ fn native_exec_command(app: &App) -> String {
     } else {
         format!("{} {}", app.command.trim(), app.args.trim())
     }
+}
+
+fn layout_requires_floating(layout: &str) -> bool {
+    layout
+        .split(';')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .any(|command| command.starts_with("move position") || command.starts_with("resize set"))
 }
 
 fn detached_exec_command(app: &App, command: &str) -> String {
@@ -1443,8 +1480,27 @@ mod tests {
             script.contains("i3_match() {"),
             "script should include retry helper for window criteria"
         );
+        assert!(script.contains("i3_match 'title=\"first\"' 'nop'"));
+        assert!(script.contains("i3_match 'title=\"first\"' 'floating enable'"));
         assert!(script.contains("i3_match 'title=\"first\"' 'move to workspace 1'"));
         assert!(script.contains("i3 'exec --no-startup-id"));
         assert!(script.contains("echo 'launching second'"));
+    }
+
+    #[test]
+    fn generated_script_launches_all_apps_before_arranging() {
+        let script = generate_script(&two_app_config()).expect("script should generate");
+
+        let launch_second = script
+            .find("echo 'launching second'")
+            .expect("second app should be launched");
+        let arrange_first = script
+            .find("echo 'arranging first'")
+            .expect("first app should be arranged");
+
+        assert!(
+            launch_second < arrange_first,
+            "all apps should launch before any matched layout commands run"
+        );
     }
 }
